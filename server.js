@@ -13,11 +13,28 @@ try {
 
 const WebSocket = require("ws");
 const http = require("http");
+const { createClient } = require("@supabase/supabase-js");
 
 // --- Config ------------------------------------------------------------
 const PORT = process.env.PORT || 8787;            // Render assigns PORT automatically
 const FINNHUB_TOKEN = process.env.FINNHUB_TOKEN;  // Set this in Render's Environment tab
-const SYMBOL = "OANDA:XAU_USD";
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const ASSET_SYMBOLS = {
+  GOLD: "OANDA:XAU_USD",
+  NASDAQ: "FXCM:NAS100"
+};
+
+const rooms = {
+  GOLD: new Set(),
+  NASDAQ: new Set()
+};
+
+const lastPrice = {
+  GOLD: null,
+  NASDAQ: null
+};
 
 if (!FINNHUB_TOKEN) {
   console.error(
@@ -25,6 +42,15 @@ if (!FINNHUB_TOKEN) {
     "The HTTP/WebSocket server will still start, but no price data will be " +
     "relayed until FINNHUB_TOKEN is set (Render: Environment tab -> Add Environment Variable)."
   );
+}
+
+// Initialize Supabase admin client for backend TP/SL automation
+let supabaseAdmin = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+  supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  console.log("[supabase] Admin client initialized for TP/SL monitoring");
+} else {
+  console.error("[supabase] Missing credentials. Automatic TP/SL execution disabled.");
 }
 
 // --- HTTP server (Render needs something bound to PORT) ----------------
@@ -35,28 +61,108 @@ const server = http.createServer((req, res) => {
 
 // --- WebSocket server for game clients -----------------------------------
 const wss = new WebSocket.Server({ server });
-const clients = new Set();
 
-wss.on("connection", (ws) => {
-  clients.add(ws);
-  console.log(`[clients] Connected. Total: ${clients.size}`);
+wss.on("connection", (ws, req) => {
+  let requestedAsset = "GOLD";
+  try {
+    const url = new URL(req.url, "http://localhost");
+    const param = url.searchParams.get("symbol");
+    if (param && param.toUpperCase() === "NASDAQ") {
+      requestedAsset = "NASDAQ";
+    }
+  } catch (err) {
+    // Fallback to GOLD on parsing errors
+  }
+
+  const assetRoom = rooms[requestedAsset] ? requestedAsset : "GOLD";
+  rooms[assetRoom].add(ws);
+  ws.asset = assetRoom;
+
+  console.log(`[clients] Connected to ${assetRoom}. Total in room: ${rooms[assetRoom].size}`);
+
+  if (lastPrice[assetRoom] !== null) {
+    ws.send(JSON.stringify({
+      symbol: ASSET_SYMBOLS[assetRoom],
+      asset: assetRoom,
+      price: lastPrice[assetRoom],
+      source: "broker",
+      timestamp: Date.now()
+    }));
+  }
 
   ws.on("close", () => {
-    clients.delete(ws);
-    console.log(`[clients] Disconnected. Total: ${clients.size}`);
+    rooms[assetRoom].delete(ws);
+    console.log(`[clients] Disconnected from ${assetRoom}. Total remaining: ${rooms[assetRoom].size}`);
   });
 
   ws.on("error", (err) => {
-    console.error("[clients] Socket error:", err.message);
+    console.error(`[clients] Socket error in room ${assetRoom}:`, err.message);
   });
 });
 
-function broadcast(payload) {
+function broadcastToRoom(asset, payload) {
   const message = JSON.stringify(payload);
-  for (const client of clients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(message);
+  if (rooms[asset]) {
+    for (const client of rooms[asset]) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(message);
+      }
     }
+  }
+}
+
+// --- Automated Engine to monitor and execute TP/SL targets ----------------
+async function checkTpSl(asset, price) {
+  if (!supabaseAdmin) return;
+
+  try {
+    const res = await supabaseAdmin
+      .from("duel_trades")
+      .select("id, side, entry_price, tp, sl, duel_id, trading_duels!inner(asset,status)")
+      .eq("status", "open")
+      .eq("trading_duels.asset", asset)
+      .eq("trading_duels.status", "active");
+
+    if (res.error || !res.data || res.data.length === 0) return;
+
+    for (let i = 0; i < res.data.length; i++) {
+      const t = res.data[i];
+      let hit = null;
+
+      if (t.side === "buy") {
+        if (t.tp != null && price >= t.tp) hit = "tp";
+        else if (t.sl != null && price <= t.sl) hit = "sl";
+      } else {
+        if (t.tp != null && price <= t.tp) hit = "tp";
+        else if (t.sl != null && price >= t.sl) hit = "sl";
+      }
+
+      if (hit) {
+        const updateRes = await supabaseAdmin
+          .from("duel_trades")
+          .update({
+            status: "closed",
+            close_price: price,
+            closed_at: new Date().toISOString(),
+            closed_reason: hit
+          })
+          .eq("id", t.id)
+          .eq("status", "open");
+
+        if (!updateRes.error) {
+          console.log(`[engine] Auto-closed trade ${t.id} due to ${hit.toUpperCase()} hit at ${price}`);
+          broadcastToRoom(asset, {
+            type: "trade_closed",
+            tradeId: t.id,
+            reason: hit,
+            price: price,
+            asset: asset
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[engine] Error executing target checks:", err.message);
   }
 }
 
@@ -68,14 +174,11 @@ const MAX_DELAY_MS = 30000;
 
 function getBackoffDelay() {
   const delay = Math.min(BASE_DELAY_MS * Math.pow(2, reconnectAttempt), MAX_DELAY_MS);
-  // add jitter so multiple reconnects don't stack in lockstep
   return delay + Math.floor(Math.random() * 500);
 }
 
 function connectToFinnhub() {
   if (!FINNHUB_TOKEN) {
-    // Keep retrying periodically in case the token is added later
-    // (e.g. Render env var saved after the service already booted).
     console.log("[finnhub] No token set yet — retrying in 10s.");
     setTimeout(connectToFinnhub, 10000);
     return;
@@ -85,8 +188,11 @@ function connectToFinnhub() {
 
   finnhubSocket.on("open", () => {
     console.log("[finnhub] Connected");
-    reconnectAttempt = 0; // reset backoff on a successful connection
-    finnhubSocket.send(JSON.stringify({ type: "subscribe", symbol: SYMBOL }));
+    reconnectAttempt = 0;
+    Object.values(ASSET_SYMBOLS).forEach((sym) => {
+      finnhubSocket.send(JSON.stringify({ type: "subscribe", symbol: sym }));
+      console.log(`[finnhub] Subscribed to ${sym}`);
+    });
   });
 
   finnhubSocket.on("message", (raw) => {
@@ -100,13 +206,25 @@ function connectToFinnhub() {
 
     if (data.type === "trade" && Array.isArray(data.data)) {
       for (const tick of data.data) {
+        let asset = null;
+        if (tick.s === ASSET_SYMBOLS.NASDAQ) asset = "NASDAQ";
+        else if (tick.s === ASSET_SYMBOLS.GOLD) asset = "GOLD";
+
+        if (!asset) continue;
+
+        const price = tick.p;
+        lastPrice[asset] = price;
+
         const outgoing = {
-          symbol: tick.s || SYMBOL,
-          price: tick.p,
+          symbol: tick.s,
+          asset: asset,
+          price: price,
           timestamp: Date.now(),
-          source: "broker" // required by the frontend's gating check
+          source: "broker"
         };
-        broadcast(outgoing);
+
+        broadcastToRoom(asset, outgoing);
+        checkTpSl(asset, price);
       }
     }
   });
