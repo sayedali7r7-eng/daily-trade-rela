@@ -67,21 +67,20 @@ app.get("/", (req, res) => {
   res.send("price-server relay is running\n");
 });
 
-// Endpoint لجلب الشموع التاريخية (آخر 3 أيام أو حسب الطلب)
+// Endpoint لجلب الشموع التاريخية (محدثة لتعمل عبر Twelve Data للذهب والنازداك مجاناً)
 app.get("/api/candles", (req, res) => {
   try {
-    const symbol = req.query.symbol || "OANDA:XAU_USD";
-    const resolution = req.query.resolution || "5";
-    const days = parseInt(req.query.days) || 3;
+    const symbolParam = req.query.symbol || "GOLD";
+    let twelvedataSymbol = "XAU/USD";
 
-    const to = Math.floor(Date.now() / 1000);
-    const from = to - (days * 24 * 60 * 60);
-
-    if (!FINNHUB_TOKEN) {
-      return res.status(400).json({ error: "FINNHUB_TOKEN is missing in environment variables" });
+    if (symbolParam.toUpperCase().includes("NAS") || symbolParam.toUpperCase().includes("NASDAQ")) {
+      twelvedataSymbol = "NDX";
     }
 
-    const url = `https://finnhub.io/api/v1/forex/candle?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${to}&token=${FINNHUB_TOKEN}`;
+    const apiKey = process.env.TWELVEDATA_API_KEY || "demo"; 
+    const interval = req.query.resolution === "1" ? "1min" : "5min";
+
+    const url = `https://api.twelvedata.com/time_series?symbol=${twelvedataSymbol}&interval=${interval}&outputsize=100&apikey=${apiKey}`;
 
     https.get(url, (apiRes) => {
       let body = "";
@@ -89,21 +88,22 @@ app.get("/api/candles", (req, res) => {
       apiRes.on("end", () => {
         try {
           const data = JSON.parse(body);
-          if (data.s !== "ok" || !data.t) {
-            return res.status(400).json({ error: "No data from Finnhub", details: data });
+          if (data.status === "error" || !data.values) {
+            return res.status(400).json({ error: "Failed to fetch candles", details: data });
           }
 
-          const formattedCandles = data.t.map((timestamp, index) => ({
-            time: timestamp,
-            open: data.o[index],
-            high: data.h[index],
-            low: data.l[index],
-            close: data.c[index]
+          // ترتيب البيانات لتكون من القديم إلى الحديث بالشكل المناسب للشارت
+          const formattedCandles = data.values.reverse().map((item) => ({
+            time: Math.floor(new Date(item.datetime).getTime() / 1000),
+            open: parseFloat(item.open),
+            high: parseFloat(item.high),
+            low: parseFloat(item.low),
+            close: parseFloat(item.close)
           }));
 
           res.json(formattedCandles);
         } catch (e) {
-          res.status(500).json({ error: "Failed to parse response from Finnhub" });
+          res.status(500).json({ error: "Failed to parse candle data" });
         }
       });
     }).on("error", (err) => {
