@@ -67,7 +67,7 @@ app.get("/", (req, res) => {
   res.send("price-server relay is running\n");
 });
 
-// Endpoint لجلب الشموع التاريخية (محدثة لتعمل عبر Twelve Data للذهب والنازداك مجاناً)
+// Endpoint لجلب الشموع التاريخية (محدثة لتغطية اسبوع تداول كامل - 5 أيام)
 app.get("/api/candles", (req, res) => {
   try {
     const symbolParam = req.query.symbol || "GOLD";
@@ -78,9 +78,24 @@ app.get("/api/candles", (req, res) => {
     }
 
     const apiKey = process.env.TWELVEDATA_API_KEY || "demo"; 
-    const interval = req.query.resolution === "1" ? "1min" : "5min";
+    
+    // تحديد الفريم المباشر وحساب عدد الشموع المطلوبة لـ 5 أيام تداول
+    let interval = "5min";
+    let outputsize = 1440; // 5 أيام تداول لفريم الـ 5m (288 شمعة × 5 = 1440)
 
-    const url = `https://api.twelvedata.com/time_series?symbol=${twelvedataSymbol}&interval=${interval}&outputsize=100&apikey=${apiKey}`;
+    const resParam = String(req.query.resolution || "5").toLowerCase();
+    if (resParam === "1" || resParam === "1m") {
+      interval = "1min";
+      outputsize = 5000; // الحد الأقصى لجلب أكبر قدر من الشموع الدقيقة
+    } else if (resParam === "15" || resParam === "15m") {
+      interval = "15min";
+      outputsize = 480;
+    } else if (resParam === "60" || resParam === "1h") {
+      interval = "1h";
+      outputsize = 120;
+    }
+
+    const url = `https://api.twelvedata.com/time_series?symbol=${twelvedataSymbol}&interval=${interval}&outputsize=${outputsize}&apikey=${apiKey}`;
 
     https.get(url, (apiRes) => {
       let body = "";
@@ -88,18 +103,24 @@ app.get("/api/candles", (req, res) => {
       apiRes.on("end", () => {
         try {
           const data = JSON.parse(body);
-          if (data.status === "error" || !data.values) {
+          if (data.status === "error" || !data.values || !Array.isArray(data.values)) {
             return res.status(400).json({ error: "Failed to fetch candles", details: data });
           }
 
-          // ترتيب البيانات لتكون من القديم إلى الحديث بالشكل المناسب للشارت
-          const formattedCandles = data.values.reverse().map((item) => ({
-            time: Math.floor(new Date(item.datetime).getTime() / 1000),
-            open: parseFloat(item.open),
-            high: parseFloat(item.high),
-            low: parseFloat(item.low),
-            close: parseFloat(item.close)
-          }));
+          // ترتيب البيانات من القديم إلى الحديث وتحويل الوقت إلى Unix Timestamp صحيح
+          const formattedCandles = data.values
+            .reverse()
+            .map((item) => {
+              const unixTime = Math.floor(new Date(item.datetime.replace(" ", "T") + "Z").getTime() / 1000);
+              return {
+                time: unixTime,
+                open: parseFloat(item.open),
+                high: parseFloat(item.high),
+                low: parseFloat(item.low),
+                close: parseFloat(item.close)
+              };
+            })
+            .filter((c) => !isNaN(c.time) && !isNaN(c.close));
 
           res.json(formattedCandles);
         } catch (e) {
