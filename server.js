@@ -3,32 +3,23 @@
 // frontend expects, including the "source": "broker" field that unlocks
 // the Buy/Sell buttons client-side.
 
+// Load variables from a local .env file if present (no-op in production
+// environments like Render, which inject env vars directly).
 try {
   require("dotenv").config();
 } catch (err) {
   // dotenv not installed — fine in production, just skip.
 }
 
-const express = require("express");
-const http = require("http");
 const WebSocket = require("ws");
-const https = require("https");
+const http = require("http");
 const { createClient } = require("@supabase/supabase-js");
 
 // --- Config ------------------------------------------------------------
-const PORT = process.env.PORT || 8787;
-const FINNHUB_TOKEN = process.env.FINNHUB_TOKEN || process.env.FINNHUB_API_KEY;
+const PORT = process.env.PORT || 8787;            // Render assigns PORT automatically
+const FINNHUB_TOKEN = process.env.FINNHUB_TOKEN;  // Set this in Render's Environment tab
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-const app = express();
-
-// CORS Middleware
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
-  next();
-});
 
 const ASSET_SYMBOLS = {
   GOLD: "OANDA:XAU_USD",
@@ -49,11 +40,11 @@ if (!FINNHUB_TOKEN) {
   console.error(
     "[config] Missing FINNHUB_TOKEN environment variable. " +
     "The HTTP/WebSocket server will still start, but no price data will be " +
-    "relayed until FINNHUB_TOKEN is set."
+    "relayed until FINNHUB_TOKEN is set (Render: Environment tab -> Add Environment Variable)."
   );
 }
 
-// Initialize Supabase admin client
+// Initialize Supabase admin client for backend TP/SL automation
 let supabaseAdmin = null;
 if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -62,75 +53,11 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   console.error("[supabase] Missing credentials. Automatic TP/SL execution disabled.");
 }
 
-// --- HTTP Routes -------------------------------------------------------
-app.get("/", (req, res) => {
-  res.send("price-server relay is running\n");
+// --- HTTP server (Render needs something bound to PORT) ----------------
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("price-server relay is running\n");
 });
-
-// Endpoint لجلب الشموع التاريخية المضمونة للفوركس بدون مكتبات خارجية
-app.get("/api/candles", (req, res) => {
-  try {
-    const symbolParam = req.query.symbol || "GOLD";
-    
-    // رموز عقود الذهب والنازداك
-    let querySymbol = "XAUUSD";
-    if (symbolParam.toUpperCase().includes("NAS") || symbolParam.toUpperCase().includes("NASDAQ")) {
-      querySymbol = "NAS100";
-    }
-
-    // جلب البيانات مباشرة من API مفتوح وبدون الحاجة لمكتبات مجانية على Render
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${querySymbol === "XAUUSD" ? "GC=F" : "NQ=F"}?interval=5m&range=5d`;
-
-    const options = {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      }
-    };
-
-    https.get(url, options, (apiRes) => {
-      let body = "";
-      apiRes.on("data", (chunk) => body += chunk);
-      apiRes.on("end", () => {
-        try {
-          const json = JSON.parse(body);
-          const result = json.chart?.result?.[0];
-
-          if (!result || !result.timestamp) {
-            return res.json([]);
-          }
-
-          const timestamps = result.timestamp;
-          const quote = result.indicators.quote[0];
-
-          const formattedCandles = [];
-          for (let i = 0; i < timestamps.length; i++) {
-            if (quote.open[i] && quote.high[i] && quote.low[i] && quote.close[i]) {
-              formattedCandles.push({
-                time: timestamps[i],
-                open: Number(quote.open[i].toFixed(2)),
-                high: Number(quote.high[i].toFixed(2)),
-                low: Number(quote.low[i].toFixed(2)),
-                close: Number(quote.close[i].toFixed(2))
-              });
-            }
-          }
-
-          res.json(formattedCandles);
-        } catch (e) {
-          res.json([]);
-        }
-      });
-    }).on("error", () => {
-      res.json([]);
-    });
-
-  } catch (error) {
-    res.json([]);
-  }
-});
-
-// Create HTTP server wrapping Express app
-const server = http.createServer(app);
 
 // --- WebSocket server for game clients -----------------------------------
 const wss = new WebSocket.Server({ server });
@@ -144,7 +71,7 @@ wss.on("connection", (ws, req) => {
       requestedAsset = "NASDAQ";
     }
   } catch (err) {
-    // Fallback to GOLD
+    // Fallback to GOLD on parsing errors
   }
 
   const assetRoom = rooms[requestedAsset] ? requestedAsset : "GOLD";
