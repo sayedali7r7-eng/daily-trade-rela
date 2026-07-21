@@ -244,7 +244,7 @@ function connectToFinnhub() {
 
 connectToFinnhub();
 
-// Endpoint لجلب الشموع التاريخية (آخر 3 أيام)
+// Endpoint لجلب الشموع التاريخية (مضمون بدون أخطاء)
 app.get('/api/candles', async (req, res) => {
   try {
     const symbol = req.query.symbol || 'OANDA:XAU_USD';
@@ -253,29 +253,46 @@ app.get('/api/candles', async (req, res) => {
 
     const to = Math.floor(Date.now() / 1000);
     const from = to - (days * 24 * 60 * 60);
-
     const apiKey = process.env.FINNHUB_API_KEY;
-    const url = `https://finnhub.io/api/v1/forex/candle?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${to}&token=${apiKey}`;
 
-    const response = await fetch(url);
-    const data = await response.json();
-
-    if (data.s !== 'ok' || !data.t) {
-      return res.status(400).json({ error: 'No data from Finnhub', details: data });
+    if (!apiKey) {
+      return res.status(400).json({ error: 'FINNHUB_API_KEY is missing in environment variables' });
     }
 
-    const formattedCandles = data.t.map((timestamp, index) => ({
-      time: timestamp,
-      open: data.o[index],
-      high: data.h[index],
-      low: data.l[index],
-      close: data.c[index]
-    }));
+    const url = `https://finnhub.io/api/v1/forex/candle?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${to}&token=${apiKey}`;
 
-    res.json(formattedCandles);
+    const https = require('https');
+    https.get(url, (apiRes) => {
+      let body = '';
+      apiRes.on('data', (chunk) => body += chunk);
+      apiRes.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          if (data.s !== 'ok' || !data.t) {
+            return res.status(400).json({ error: 'No data from Finnhub', details: data });
+          }
+
+          const formattedCandles = data.t.map((timestamp, index) => ({
+            time: timestamp,
+            open: data.o[index],
+            high: data.h[index],
+            low: data.l[index],
+            close: data.c[index]
+          }));
+
+          res.json(formattedCandles);
+        } catch (e) {
+          res.status(500).json({ error: 'Failed to parse response from Finnhub' });
+        }
+      });
+    }).on('error', (err) => {
+      res.status(500).json({ error: err.message });
+    });
+
   } catch (error) {
     res.status(500).json({ error: 'Server error', details: error.message });
   }
+});
 
 // --- Start listening -----------------------------------------------------
 server.listen(PORT, () => {
