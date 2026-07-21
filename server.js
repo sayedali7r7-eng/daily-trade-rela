@@ -54,51 +54,42 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   console.error("[supabase] Missing credentials. Automatic TP/SL execution disabled.");
 }
 
-// --- Candle history endpoint (Yahoo Finance passthrough) ----------------
-// Maps our internal asset names to real, tradable futures contracts so the
-// Lightweight Chart can pull a genuine multi-day history instead of the
-// few hours Yahoo returns for some spot/CFD-style tickers.
-const YAHOO_SYMBOLS = {
-  GOLD: "GC=F",    // Gold futures
-  NASDAQ: "NQ=F"   // Nasdaq 100 futures
+// --- Candle history endpoint (Twelve Data passthrough) ------------------
+// Maps our internal asset names to Twelve Data's symbol format.
+const TWELVE_DATA_SYMBOLS = {
+  GOLD: "XAU/USD",
+  NASDAQ: "NDX"
 };
 
-function resolveYahooSymbol(symbolParam) {
+// Keep the key out of source control, same pattern as FINNHUB_TOKEN /
+// SUPABASE_SERVICE_ROLE_KEY above. Falls back to the key you shared so this
+// keeps working immediately — move it into Render's Environment tab (and
+// rotate it, since it's now been pasted into a chat) when you get a chance.
+const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || "af0b3fc31acb4ee8a372f586d23b1b51";
+
+function resolveTwelveDataSymbol(symbolParam) {
   const s = (symbolParam || "GOLD").toUpperCase();
-  if (s.includes("NAS") || s.includes("NASDAQ")) return YAHOO_SYMBOLS.NASDAQ;
-  return YAHOO_SYMBOLS.GOLD; // default / GOLD / XAU
+  if (s.includes("NAS") || s.includes("NASDAQ")) return TWELVE_DATA_SYMBOLS.NASDAQ;
+  return TWELVE_DATA_SYMBOLS.GOLD; // default / GOLD / XAU
 }
 
 function handleCandlesRequest(searchParams, res) {
   const symbolParam = (searchParams.get("symbol") || "GOLD").toUpperCase();
   const intervalParam = searchParams.get("interval") || "5m";
-  const yahooSymbol = resolveYahooSymbol(symbolParam);
+  const tdSymbol = resolveTwelveDataSymbol(symbolParam);
 
-  // Yahoo's public chart endpoint throws a 400 when range=7d is combined
-  // directly with interval=5m. period1/period2 (unix-second timestamps)
-  // sidestep that restriction and return a clean, full history array.
-  // 1m intraday data only exists for ~2 days on Yahoo's public endpoint, so
-  // that combination still stays capped to avoid an empty/short response;
-  // `days` can be overridden explicitly via the query string.
-  const daysBack = Number(searchParams.get("days")) || (intervalParam === "1m" ? 2 : 7);
-  const nowInSeconds = Math.floor(Date.now() / 1000);
-  const secondsBack = daysBack * 24 * 60 * 60;
-  const period1 = nowInSeconds - secondsBack;
-  const period2 = nowInSeconds;
+  // Twelve Data uses "1min"/"5min" rather than our "1m"/"5m" shorthand.
+  const tdInterval = intervalParam === "1m" ? "1min" : "5min";
+  const outputsize = Number(searchParams.get("outputsize")) || 500;
 
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=${intervalParam}&period1=${period1}&period2=${period2}`;
-  const options = {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-  };
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(tdSymbol)}&interval=${tdInterval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_API_KEY}`;
 
   const sendJson = (candles) => {
     const payload = JSON.stringify(candles);
     res.writeHead(200, {
       "Content-Type": "application/json; charset=utf-8",
       // Explicit Content-Length (rather than chunked encoding) so large
-      // 7-day/5m payloads aren't cut short client-side.
+      // 500-candle payloads aren't cut short client-side.
       "Content-Length": Buffer.byteLength(payload),
       "Cache-Control": "no-store",
       "Access-Control-Allow-Origin": "*"
@@ -106,45 +97,35 @@ function handleCandlesRequest(searchParams, res) {
     res.end(payload);
   };
 
-  https.get(url, options, (apiRes) => {
+  https.get(url, (apiRes) => {
     let body = "";
     apiRes.setEncoding("utf8");
     apiRes.on("data", (chunk) => { body += chunk; });
     apiRes.on("end", () => {
       try {
         const json = JSON.parse(body);
-        const result = json.chart?.result?.[0];
-        if (!result || !result.timestamp) return sendJson([]);
-
-        const timestamps = result.timestamp;
-        const quote = result.indicators.quote[0];
-        const formattedCandles = [];
-        for (let i = 0; i < timestamps.length; i++) {
-          if (
-            quote.open[i] != null &&
-            quote.high[i] != null &&
-            quote.low[i] != null &&
-            quote.close[i] != null
-          ) {
-            formattedCandles.push({
-              time: timestamps[i], // UNIX timestamp in seconds
-              open: Number(quote.open[i].toFixed(2)),
-              high: Number(quote.high[i].toFixed(2)),
-              low: Number(quote.low[i].toFixed(2)),
-              close: Number(quote.close[i].toFixed(2))
-            });
-          }
+        if (json.status === "error" || json.code) {
+          console.error("[candles] Twelve Data error:", json.message || body);
+          return sendJson([]);
         }
-        // Sort ascending for Lightweight Charts compatibility
-        formattedCandles.sort((a, b) => a.time - b.time);
+        if (!json.values || !Array.isArray(json.values)) return sendJson([]);
+
+        // Twelve Data returns newest-first; reverse for Lightweight Charts.
+        const formattedCandles = json.values.slice().reverse().map((c) => ({
+          time: Math.floor(new Date(c.datetime).getTime() / 1000),
+          open: Number(parseFloat(c.open).toFixed(2)),
+          high: Number(parseFloat(c.high).toFixed(2)),
+          low: Number(parseFloat(c.low).toFixed(2)),
+          close: Number(parseFloat(c.close).toFixed(2))
+        }));
         sendJson(formattedCandles);
       } catch (err) {
-        console.error("[candles] Failed to parse Yahoo Finance response:", err.message);
+        console.error("[candles] Failed to parse Twelve Data response:", err.message);
         sendJson([]);
       }
     });
   }).on("error", (err) => {
-    console.error("[candles] Yahoo Finance request failed:", err.message);
+    console.error("[candles] Twelve Data request failed:", err.message);
     sendJson([]);
   });
 }
