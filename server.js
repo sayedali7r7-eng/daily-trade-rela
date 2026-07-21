@@ -67,64 +67,68 @@ app.get("/", (req, res) => {
   res.send("price-server relay is running\n");
 });
 
-// Endpoint لجلب الشموع التاريخية (محدثة لتغطية اسبوع تداول كامل - 5 أيام)
+// Endpoint لجلب الشموع التاريخية عبر Yahoo Finance (مجاني 100% وبدون قيود على التاريخ)
 app.get("/api/candles", (req, res) => {
   try {
     const symbolParam = req.query.symbol || "GOLD";
-    let twelvedataSymbol = "XAU/USD";
+    let yahooSymbol = "GC=F"; // الذهب futures
 
     if (symbolParam.toUpperCase().includes("NAS") || symbolParam.toUpperCase().includes("NASDAQ")) {
-      twelvedataSymbol = "NDX";
+      yahooSymbol = "NQ=F"; // النازداك futures
     }
 
-    const apiKey = process.env.TWELVEDATA_API_KEY || "demo"; 
-    
-    // تحديد الفريم المباشر وحساب عدد الشموع المطلوبة لـ 5 أيام تداول
-    let interval = "5min";
-    let outputsize = 1440; // 5 أيام تداول لفريم الـ 5m (288 شمعة × 5 = 1440)
-
+    let interval = "5m";
     const resParam = String(req.query.resolution || "5").toLowerCase();
-    if (resParam === "1" || resParam === "1m") {
-      interval = "1min";
-      outputsize = 5000; // الحد الأقصى لجلب أكبر قدر من الشموع الدقيقة
-    } else if (resParam === "15" || resParam === "15m") {
-      interval = "15min";
-      outputsize = 480;
-    } else if (resParam === "60" || resParam === "1h") {
-      interval = "1h";
-      outputsize = 120;
-    }
+    if (resParam === "1" || resParam === "1m") interval = "1m";
+    else if (resParam === "15" || resParam === "15m") interval = "15m";
+    else if (resParam === "60" || resParam === "1h") interval = "1h";
 
-    const url = `https://api.twelvedata.com/time_series?symbol=${twelvedataSymbol}&interval=${interval}&outputsize=${outputsize}&apikey=${apiKey}`;
+    // نطلب نطاق 5 أيام (5d) لجلب أسبوع تداول كاملاً
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?range=5d&interval=${interval}`;
 
-    https.get(url, (apiRes) => {
+    const options = {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+      }
+    };
+
+    https.get(url, options, (apiRes) => {
       let body = "";
       apiRes.on("data", (chunk) => body += chunk);
       apiRes.on("end", () => {
         try {
           const data = JSON.parse(body);
-          if (data.status === "error" || !data.values || !Array.isArray(data.values)) {
-            return res.status(400).json({ error: "Failed to fetch candles", details: data });
+          const result = data?.chart?.result?.[0];
+
+          if (!result || !result.timestamp || !result.indicators?.quote?.[0]) {
+            return res.status(400).json({ error: "Failed to fetch candles from Yahoo", details: data });
           }
 
-          // ترتيب البيانات من القديم إلى الحديث وتحويل الوقت إلى Unix Timestamp صحيح
-          const formattedCandles = data.values
-            .reverse()
-            .map((item) => {
-              const unixTime = Math.floor(new Date(item.datetime.replace(" ", "T") + "Z").getTime() / 1000);
-              return {
-                time: unixTime,
-                open: parseFloat(item.open),
-                high: parseFloat(item.high),
-                low: parseFloat(item.low),
-                close: parseFloat(item.close)
-              };
-            })
-            .filter((c) => !isNaN(c.time) && !isNaN(c.close));
+          const timestamps = result.timestamp;
+          const quote = result.indicators.quote[0];
+
+          const formattedCandles = [];
+          for (let i = 0; i < timestamps.length; i++) {
+            // نتأكد إن الشمعة مكتملة وما فيها قيم null
+            if (
+              quote.open[i] != null &&
+              quote.high[i] != null &&
+              quote.low[i] != null &&
+              quote.close[i] != null
+            ) {
+              formattedCandles.push({
+                time: timestamps[i],
+                open: parseFloat(quote.open[i].toFixed(2)),
+                high: parseFloat(quote.high[i].toFixed(2)),
+                low: parseFloat(quote.low[i].toFixed(2)),
+                close: parseFloat(quote.close[i].toFixed(2))
+              });
+            }
+          }
 
           res.json(formattedCandles);
         } catch (e) {
-          res.status(500).json({ error: "Failed to parse candle data" });
+          res.status(500).json({ error: "Failed to parse Yahoo candle data" });
         }
       });
     }).on("error", (err) => {
