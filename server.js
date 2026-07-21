@@ -67,68 +67,59 @@ app.get("/", (req, res) => {
   res.send("price-server relay is running\n");
 });
 
-// Endpoint لجلب الشموع التاريخية عبر Yahoo Finance (مجاني 100% وبدون قيود على التاريخ)
+// Endpoint لجلب الشموع التاريخية المحدثة عبر Twelve Data
 app.get("/api/candles", (req, res) => {
   try {
     const symbolParam = req.query.symbol || "GOLD";
-    let yahooSymbol = "GC=F"; // الذهب futures
+    let twelvedataSymbol = "XAU/USD";
 
     if (symbolParam.toUpperCase().includes("NAS") || symbolParam.toUpperCase().includes("NASDAQ")) {
-      yahooSymbol = "NQ=F"; // النازداك futures
+      twelvedataSymbol = "NDX";
     }
 
-    let interval = "5m";
+    const apiKey = process.env.TWELVEDATA_API_KEY || "demo"; 
+    
+    let interval = "5min";
     const resParam = String(req.query.resolution || "5").toLowerCase();
-    if (resParam === "1" || resParam === "1m") interval = "1m";
-    else if (resParam === "15" || resParam === "15m") interval = "15m";
+    if (resParam === "1" || resParam === "1m") interval = "1min";
+    else if (resParam === "15" || resParam === "15m") interval = "15min";
     else if (resParam === "60" || resParam === "1h") interval = "1h";
 
-    // نطلب نطاق 5 أيام (5d) لجلب أسبوع تداول كاملاً
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?range=5d&interval=${interval}`;
+    // نطلب 500 شمعة مباشرة من Twelve Data
+    const url = `https://api.twelvedata.com/time_series?symbol=${twelvedataSymbol}&interval=${interval}&outputsize=500&apikey=${apiKey}`;
 
-    const options = {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-      }
-    };
-
-    https.get(url, options, (apiRes) => {
+    https.get(url, (apiRes) => {
       let body = "";
       apiRes.on("data", (chunk) => body += chunk);
       apiRes.on("end", () => {
         try {
           const data = JSON.parse(body);
-          const result = data?.chart?.result?.[0];
-
-          if (!result || !result.timestamp || !result.indicators?.quote?.[0]) {
-            return res.status(400).json({ error: "Failed to fetch candles from Yahoo", details: data });
+          
+          if (data.status === "error" || !data.values || !Array.isArray(data.values)) {
+            console.error("[TwelveData Error]:", data);
+            return res.status(400).json({ error: "Failed to fetch candles", details: data });
           }
 
-          const timestamps = result.timestamp;
-          const quote = result.indicators.quote[0];
-
-          const formattedCandles = [];
-          for (let i = 0; i < timestamps.length; i++) {
-            // نتأكد إن الشمعة مكتملة وما فيها قيم null
-            if (
-              quote.open[i] != null &&
-              quote.high[i] != null &&
-              quote.low[i] != null &&
-              quote.close[i] != null
-            ) {
-              formattedCandles.push({
-                time: timestamps[i],
-                open: parseFloat(quote.open[i].toFixed(2)),
-                high: parseFloat(quote.high[i].toFixed(2)),
-                low: parseFloat(quote.low[i].toFixed(2)),
-                close: parseFloat(quote.close[i].toFixed(2))
-              });
-            }
-          }
+          // ترتيب البيانات من القديم إلى الحديث وترجمة الوقت إلى Unix Timestamp
+          const formattedCandles = data.values
+            .reverse()
+            .map((item) => {
+              const timeStr = item.datetime.replace(" ", "T") + "Z";
+              const unixTime = Math.floor(new Date(timeStr).getTime() / 1000);
+              
+              return {
+                time: unixTime,
+                open: parseFloat(item.open),
+                high: parseFloat(item.high),
+                low: parseFloat(item.low),
+                close: parseFloat(item.close)
+              };
+            })
+            .filter((c) => !isNaN(c.time) && !isNaN(c.close));
 
           res.json(formattedCandles);
         } catch (e) {
-          res.status(500).json({ error: "Failed to parse Yahoo candle data" });
+          res.status(500).json({ error: "Failed to parse candle data" });
         }
       });
     }).on("error", (err) => {
