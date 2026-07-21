@@ -244,6 +244,39 @@ function connectToFinnhub() {
 
 connectToFinnhub();
 
+// Endpoint لجلب الشموع التاريخية (آخر 3 أيام)
+app.get('/api/candles', async (req, res) => {
+  try {
+    const symbol = req.query.symbol || 'OANDA:XAU_USD';
+    const resolution = req.query.resolution || '5';
+    const days = parseInt(req.query.days) || 3;
+
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - (days * 24 * 60 * 60);
+
+    const apiKey = process.env.FINNHUB_API_KEY;
+    const url = `https://finnhub.io/api/v1/forex/candle?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${to}&token=${apiKey}`;
+
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (data.s !== 'ok' || !data.t) {
+      return res.status(400).json({ error: 'No data from Finnhub', details: data });
+    }
+
+    const formattedCandles = data.t.map((timestamp, index) => ({
+      time: timestamp,
+      open: data.o[index],
+      high: data.h[index],
+      low: data.l[index],
+      close: data.c[index]
+    }));
+
+    res.json(formattedCandles);
+  } catch (error) {
+    res.status(500).json({ error: 'Server error', details: error.message });
+  }
+});
 // --- Start listening -----------------------------------------------------
 server.listen(PORT, () => {
   console.log(`[server] price-server relay listening on port ${PORT}`);
