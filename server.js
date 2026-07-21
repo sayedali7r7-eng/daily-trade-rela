@@ -276,7 +276,7 @@ app.get('/api/candles', async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: 'Server error', details: error.message });
   }
-});
+
 // --- Start listening -----------------------------------------------------
 server.listen(PORT, () => {
   console.log(`[server] price-server relay listening on port ${PORT}`);
