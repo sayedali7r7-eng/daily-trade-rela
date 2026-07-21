@@ -12,7 +12,7 @@ try {
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
-const https = require("https");
+const yahooFinance = require("yahoo-finance2").default;
 const { createClient } = require("@supabase/supabase-js");
 
 // --- Config ------------------------------------------------------------
@@ -23,7 +23,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const app = express();
 
-// CORS Middleware للسماح للموقع بجلب البيانات بدون مشاكل Security
+// CORS Middleware
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
@@ -67,14 +67,16 @@ app.get("/", (req, res) => {
   res.send("price-server relay is running\n");
 });
 
-// Endpoint لجلب الشموع التاريخية المحدثة عبر Yahoo Finance query2
-app.get("/api/candles", (req, res) => {
+// Endpoint لجلب الشموع التاريخية المضمونة للفوركس
+app.get("/api/candles", async (req, res) => {
   try {
     const symbolParam = req.query.symbol || "GOLD";
-    let yahooSymbol = "GC=F"; // عقود الذهب الآجلة
+    
+    // رموز عقود الذهب والنازداك الآجلة/الفوركس
+    let yahooSymbol = "GC=F"; // Gold Futures (XAUUSD)
 
     if (symbolParam.toUpperCase().includes("NAS") || symbolParam.toUpperCase().includes("NASDAQ")) {
-      yahooSymbol = "NQ=F"; // عقود النازداك الآجلة
+      yahooSymbol = "NQ=F"; // Nasdaq Futures (NAS100)
     }
 
     let interval = "5m";
@@ -83,65 +85,34 @@ app.get("/api/candles", (req, res) => {
     else if (resParam === "15" || resParam === "15m") interval = "15m";
     else if (resParam === "60" || resParam === "1h") interval = "1h";
 
-    // نطلب نطاق 5 أيام (5d) عبر query2 وتجاوز حظر السيرفرات
-    const url = `https://query2.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?range=5d&interval=${interval}&includePrePost=false`;
-
-    const options = {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache'
-      }
+    // جلب بيانات آخر 5 أيام
+    const queryOptions = {
+      period1: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000), // قبل 5 أيام
+      interval: interval
     };
 
-    https.get(url, options, (apiRes) => {
-      let body = "";
-      apiRes.on("data", (chunk) => body += chunk);
-      apiRes.on("end", () => {
-        try {
-          const data = JSON.parse(body);
-          const result = data?.chart?.result?.[0];
+    const result = await yahooFinance.chart(yahooSymbol, queryOptions);
 
-          if (!result || !result.timestamp || !result.indicators?.quote?.[0]) {
-            console.error("[Candles Error] Failed to fetch candles:", body.substring(0, 200));
-            return res.status(400).json({ error: "Failed to fetch candles from Yahoo", details: data });
-          }
+    if (!result || !result.quotes || result.quotes.length === 0) {
+      return res.status(400).json({ error: "No candle data found for symbol" });
+    }
 
-          const timestamps = result.timestamp;
-          const quote = result.indicators.quote[0];
+    // تحويل البيانات للشكل المطلوب للشارت
+    const formattedCandles = result.quotes
+      .filter((q) => q.open != null && q.high != null && q.low != null && q.close != null)
+      .map((q) => ({
+        time: Math.floor(new Date(q.date).getTime() / 1000),
+        open: Number(q.open.toFixed(2)),
+        high: Number(q.high.toFixed(2)),
+        low: Number(q.low.toFixed(2)),
+        close: Number(q.close.toFixed(2))
+      }));
 
-          const formattedCandles = [];
-          for (let i = 0; i < timestamps.length; i++) {
-            if (
-              quote.open[i] != null &&
-              quote.high[i] != null &&
-              quote.low[i] != null &&
-              quote.close[i] != null
-            ) {
-              formattedCandles.push({
-                time: timestamps[i],
-                open: Number(parseFloat(quote.open[i]).toFixed(2)),
-                high: Number(parseFloat(quote.high[i]).toFixed(2)),
-                low: Number(parseFloat(quote.low[i]).toFixed(2)),
-                close: Number(parseFloat(quote.close[i]).toFixed(2))
-              });
-            }
-          }
-
-          res.json(formattedCandles);
-        } catch (e) {
-          console.error("[Candles JSON Parse Error]:", e.message);
-          res.status(500).json({ error: "Failed to parse candle data" });
-        }
-      });
-    }).on("error", (err) => {
-      console.error("[Candles HTTPS Request Error]:", err.message);
-      res.status(500).json({ error: err.message });
-    });
+    res.json(formattedCandles);
 
   } catch (error) {
-    res.status(500).json({ error: "Server error", details: error.message });
+    console.error("[Candles Yahoo Error]:", error.message);
+    res.status(500).json({ error: "Failed to fetch candles", details: error.message });
   }
 });
 
@@ -160,7 +131,7 @@ wss.on("connection", (ws, req) => {
       requestedAsset = "NASDAQ";
     }
   } catch (err) {
-    // Fallback to GOLD on parsing errors
+    // Fallback to GOLD
   }
 
   const assetRoom = rooms[requestedAsset] ? requestedAsset : "GOLD";
