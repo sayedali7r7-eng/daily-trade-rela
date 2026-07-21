@@ -74,13 +74,19 @@ function handleCandlesRequest(searchParams, res) {
   const intervalParam = searchParams.get("interval") || "5m";
   const yahooSymbol = resolveYahooSymbol(symbolParam);
 
-  // Full 7-day history by default so the chart has a full week for
-  // back-analysis. 1m only carries ~2 days of intraday history on Yahoo's
-  // public endpoint, so that combination stays capped. `range` can still be
-  // overridden explicitly via the query string.
-  const range = searchParams.get("range") || (intervalParam === "1m" ? "2d" : "7d");
+  // Yahoo's public chart endpoint throws a 400 when range=7d is combined
+  // directly with interval=5m. period1/period2 (unix-second timestamps)
+  // sidestep that restriction and return a clean, full history array.
+  // 1m intraday data only exists for ~2 days on Yahoo's public endpoint, so
+  // that combination still stays capped to avoid an empty/short response;
+  // `days` can be overridden explicitly via the query string.
+  const daysBack = Number(searchParams.get("days")) || (intervalParam === "1m" ? 2 : 7);
+  const nowInSeconds = Math.floor(Date.now() / 1000);
+  const secondsBack = daysBack * 24 * 60 * 60;
+  const period1 = nowInSeconds - secondsBack;
+  const period2 = nowInSeconds;
 
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=${intervalParam}&range=${range}`;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=${intervalParam}&period1=${period1}&period2=${period2}`;
   const options = {
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
