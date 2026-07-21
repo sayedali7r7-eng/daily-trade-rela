@@ -13,6 +13,7 @@ try {
 
 const WebSocket = require("ws");
 const http = require("http");
+const https = require("https");
 const { createClient } = require("@supabase/supabase-js");
 
 // --- Config ------------------------------------------------------------
@@ -53,8 +54,109 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   console.error("[supabase] Missing credentials. Automatic TP/SL execution disabled.");
 }
 
+// --- Candle history endpoint (Yahoo Finance passthrough) ----------------
+// Maps our internal asset names to real, tradable futures contracts so the
+// Lightweight Chart can pull a genuine multi-day history instead of the
+// few hours Yahoo returns for some spot/CFD-style tickers.
+const YAHOO_SYMBOLS = {
+  GOLD: "GC=F",    // Gold futures
+  NASDAQ: "NQ=F"   // Nasdaq 100 futures
+};
+
+function resolveYahooSymbol(symbolParam) {
+  const s = (symbolParam || "GOLD").toUpperCase();
+  if (s.includes("NAS") || s.includes("NASDAQ")) return YAHOO_SYMBOLS.NASDAQ;
+  return YAHOO_SYMBOLS.GOLD; // default / GOLD / XAU
+}
+
+function handleCandlesRequest(searchParams, res) {
+  const symbolParam = (searchParams.get("symbol") || "GOLD").toUpperCase();
+  const intervalParam = searchParams.get("interval") || "5m";
+  const yahooSymbol = resolveYahooSymbol(symbolParam);
+
+  // Full 7-day history by default so the chart has a full week for
+  // back-analysis. 1m only carries ~2 days of intraday history on Yahoo's
+  // public endpoint, so that combination stays capped. `range` can still be
+  // overridden explicitly via the query string.
+  const range = searchParams.get("range") || (intervalParam === "1m" ? "2d" : "7d");
+
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=${intervalParam}&range=${range}`;
+  const options = {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+  };
+
+  const sendJson = (candles) => {
+    const payload = JSON.stringify(candles);
+    res.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      // Explicit Content-Length (rather than chunked encoding) so large
+      // 7-day/5m payloads aren't cut short client-side.
+      "Content-Length": Buffer.byteLength(payload),
+      "Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": "*"
+    });
+    res.end(payload);
+  };
+
+  https.get(url, options, (apiRes) => {
+    let body = "";
+    apiRes.setEncoding("utf8");
+    apiRes.on("data", (chunk) => { body += chunk; });
+    apiRes.on("end", () => {
+      try {
+        const json = JSON.parse(body);
+        const result = json.chart?.result?.[0];
+        if (!result || !result.timestamp) return sendJson([]);
+
+        const timestamps = result.timestamp;
+        const quote = result.indicators.quote[0];
+        const formattedCandles = [];
+        for (let i = 0; i < timestamps.length; i++) {
+          if (
+            quote.open[i] != null &&
+            quote.high[i] != null &&
+            quote.low[i] != null &&
+            quote.close[i] != null
+          ) {
+            formattedCandles.push({
+              time: timestamps[i], // UNIX timestamp in seconds
+              open: Number(quote.open[i].toFixed(2)),
+              high: Number(quote.high[i].toFixed(2)),
+              low: Number(quote.low[i].toFixed(2)),
+              close: Number(quote.close[i].toFixed(2))
+            });
+          }
+        }
+        // Sort ascending for Lightweight Charts compatibility
+        formattedCandles.sort((a, b) => a.time - b.time);
+        sendJson(formattedCandles);
+      } catch (err) {
+        console.error("[candles] Failed to parse Yahoo Finance response:", err.message);
+        sendJson([]);
+      }
+    });
+  }).on("error", (err) => {
+    console.error("[candles] Yahoo Finance request failed:", err.message);
+    sendJson([]);
+  });
+}
+
 // --- HTTP server (Render needs something bound to PORT) ----------------
 const server = http.createServer((req, res) => {
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(req.url, "http://localhost");
+  } catch (err) {
+    res.writeHead(400, { "Content-Type": "text/plain" });
+    return res.end("Bad request\n");
+  }
+
+  if (parsedUrl.pathname === "/api/candles") {
+    return handleCandlesRequest(parsedUrl.searchParams, res);
+  }
+
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("price-server relay is running\n");
 });
