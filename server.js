@@ -244,7 +244,7 @@ function connectToFinnhub() {
 
 connectToFinnhub();
 
-// Endpoint لجلب الشموع التاريخية (مضمون بدون أخطاء)
+// Endpoint )
 app.get('/api/candles', async (req, res) => {
   try {
     const symbol = req.query.symbol || 'OANDA:XAU_USD';
