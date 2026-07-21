@@ -67,62 +67,76 @@ app.get("/", (req, res) => {
   res.send("price-server relay is running\n");
 });
 
-// Endpoint لجلب الشموع التاريخية المحدثة عبر Twelve Data
+// Endpoint لجلب الشموع التاريخية المحدثة عبر Yahoo Finance query2
 app.get("/api/candles", (req, res) => {
   try {
     const symbolParam = req.query.symbol || "GOLD";
-    let twelvedataSymbol = "XAU/USD";
+    let yahooSymbol = "GC=F"; // عقود الذهب الآجلة
 
     if (symbolParam.toUpperCase().includes("NAS") || symbolParam.toUpperCase().includes("NASDAQ")) {
-      twelvedataSymbol = "NDX";
+      yahooSymbol = "NQ=F"; // عقود النازداك الآجلة
     }
 
-    const apiKey = process.env.TWELVEDATA_API_KEY || "demo"; 
-    
-    let interval = "5min";
+    let interval = "5m";
     const resParam = String(req.query.resolution || "5").toLowerCase();
-    if (resParam === "1" || resParam === "1m") interval = "1min";
-    else if (resParam === "15" || resParam === "15m") interval = "15min";
+    if (resParam === "1" || resParam === "1m") interval = "1m";
+    else if (resParam === "15" || resParam === "15m") interval = "15m";
     else if (resParam === "60" || resParam === "1h") interval = "1h";
 
-    // نطلب 500 شمعة مباشرة من Twelve Data
-    const url = `https://api.twelvedata.com/time_series?symbol=${twelvedataSymbol}&interval=${interval}&outputsize=500&apikey=${apiKey}`;
+    // نطلب نطاق 5 أيام (5d) عبر query2 وتجاوز حظر السيرفرات
+    const url = `https://query2.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?range=5d&interval=${interval}&includePrePost=false`;
 
-    https.get(url, (apiRes) => {
+    const options = {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache'
+      }
+    };
+
+    https.get(url, options, (apiRes) => {
       let body = "";
       apiRes.on("data", (chunk) => body += chunk);
       apiRes.on("end", () => {
         try {
           const data = JSON.parse(body);
-          
-          if (data.status === "error" || !data.values || !Array.isArray(data.values)) {
-            console.error("[TwelveData Error]:", data);
-            return res.status(400).json({ error: "Failed to fetch candles", details: data });
+          const result = data?.chart?.result?.[0];
+
+          if (!result || !result.timestamp || !result.indicators?.quote?.[0]) {
+            console.error("[Candles Error] Failed to fetch candles:", body.substring(0, 200));
+            return res.status(400).json({ error: "Failed to fetch candles from Yahoo", details: data });
           }
 
-          // ترتيب البيانات من القديم إلى الحديث وترجمة الوقت إلى Unix Timestamp
-          const formattedCandles = data.values
-            .reverse()
-            .map((item) => {
-              const timeStr = item.datetime.replace(" ", "T") + "Z";
-              const unixTime = Math.floor(new Date(timeStr).getTime() / 1000);
-              
-              return {
-                time: unixTime,
-                open: parseFloat(item.open),
-                high: parseFloat(item.high),
-                low: parseFloat(item.low),
-                close: parseFloat(item.close)
-              };
-            })
-            .filter((c) => !isNaN(c.time) && !isNaN(c.close));
+          const timestamps = result.timestamp;
+          const quote = result.indicators.quote[0];
+
+          const formattedCandles = [];
+          for (let i = 0; i < timestamps.length; i++) {
+            if (
+              quote.open[i] != null &&
+              quote.high[i] != null &&
+              quote.low[i] != null &&
+              quote.close[i] != null
+            ) {
+              formattedCandles.push({
+                time: timestamps[i],
+                open: Number(parseFloat(quote.open[i]).toFixed(2)),
+                high: Number(parseFloat(quote.high[i]).toFixed(2)),
+                low: Number(parseFloat(quote.low[i]).toFixed(2)),
+                close: Number(parseFloat(quote.close[i]).toFixed(2))
+              });
+            }
+          }
 
           res.json(formattedCandles);
         } catch (e) {
+          console.error("[Candles JSON Parse Error]:", e.message);
           res.status(500).json({ error: "Failed to parse candle data" });
         }
       });
     }).on("error", (err) => {
+      console.error("[Candles HTTPS Request Error]:", err.message);
       res.status(500).json({ error: err.message });
     });
 
