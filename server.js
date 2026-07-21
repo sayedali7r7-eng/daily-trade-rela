@@ -3,23 +3,32 @@
 // frontend expects, including the "source": "broker" field that unlocks
 // the Buy/Sell buttons client-side.
 
-// Load variables from a local .env file if present (no-op in production
-// environments like Render, which inject env vars directly).
 try {
   require("dotenv").config();
 } catch (err) {
   // dotenv not installed — fine in production, just skip.
 }
 
-const WebSocket = require("ws");
+const express = require("express");
 const http = require("http");
+const WebSocket = require("ws");
+const https = require("https");
 const { createClient } = require("@supabase/supabase-js");
 
 // --- Config ------------------------------------------------------------
-const PORT = process.env.PORT || 8787;            // Render assigns PORT automatically
-const FINNHUB_TOKEN = process.env.FINNHUB_TOKEN;  // Set this in Render's Environment tab
+const PORT = process.env.PORT || 8787;
+const FINNHUB_TOKEN = process.env.FINNHUB_TOKEN || process.env.FINNHUB_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const app = express();
+
+// CORS Middleware للسماح للموقع بجلب البيانات بدون مشاكل Security
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+  next();
+});
 
 const ASSET_SYMBOLS = {
   GOLD: "OANDA:XAU_USD",
@@ -40,11 +49,11 @@ if (!FINNHUB_TOKEN) {
   console.error(
     "[config] Missing FINNHUB_TOKEN environment variable. " +
     "The HTTP/WebSocket server will still start, but no price data will be " +
-    "relayed until FINNHUB_TOKEN is set (Render: Environment tab -> Add Environment Variable)."
+    "relayed until FINNHUB_TOKEN is set."
   );
 }
 
-// Initialize Supabase admin client for backend TP/SL automation
+// Initialize Supabase admin client
 let supabaseAdmin = null;
 if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -53,11 +62,61 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   console.error("[supabase] Missing credentials. Automatic TP/SL execution disabled.");
 }
 
-// --- HTTP server (Render needs something bound to PORT) ----------------
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("price-server relay is running\n");
+// --- HTTP Routes -------------------------------------------------------
+app.get("/", (req, res) => {
+  res.send("price-server relay is running\n");
 });
+
+// Endpoint لجلب الشموع التاريخية (آخر 3 أيام أو حسب الطلب)
+app.get("/api/candles", (req, res) => {
+  try {
+    const symbol = req.query.symbol || "OANDA:XAU_USD";
+    const resolution = req.query.resolution || "5";
+    const days = parseInt(req.query.days) || 3;
+
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - (days * 24 * 60 * 60);
+
+    if (!FINNHUB_TOKEN) {
+      return res.status(400).json({ error: "FINNHUB_TOKEN is missing in environment variables" });
+    }
+
+    const url = `https://finnhub.io/api/v1/forex/candle?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${to}&token=${FINNHUB_TOKEN}`;
+
+    https.get(url, (apiRes) => {
+      let body = "";
+      apiRes.on("data", (chunk) => body += chunk);
+      apiRes.on("end", () => {
+        try {
+          const data = JSON.parse(body);
+          if (data.s !== "ok" || !data.t) {
+            return res.status(400).json({ error: "No data from Finnhub", details: data });
+          }
+
+          const formattedCandles = data.t.map((timestamp, index) => ({
+            time: timestamp,
+            open: data.o[index],
+            high: data.h[index],
+            low: data.l[index],
+            close: data.c[index]
+          }));
+
+          res.json(formattedCandles);
+        } catch (e) {
+          res.status(500).json({ error: "Failed to parse response from Finnhub" });
+        }
+      });
+    }).on("error", (err) => {
+      res.status(500).json({ error: err.message });
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: "Server error", details: error.message });
+  }
+});
+
+// Create HTTP server wrapping Express app
+const server = http.createServer(app);
 
 // --- WebSocket server for game clients -----------------------------------
 const wss = new WebSocket.Server({ server });
@@ -243,56 +302,6 @@ function connectToFinnhub() {
 }
 
 connectToFinnhub();
-
-// Endpoint )
-app.get('/api/candles', async (req, res) => {
-  try {
-    const symbol = req.query.symbol || 'OANDA:XAU_USD';
-    const resolution = req.query.resolution || '5';
-    const days = parseInt(req.query.days) || 3;
-
-    const to = Math.floor(Date.now() / 1000);
-    const from = to - (days * 24 * 60 * 60);
-    const apiKey = process.env.FINNHUB_API_KEY;
-
-    if (!apiKey) {
-      return res.status(400).json({ error: 'FINNHUB_API_KEY is missing in environment variables' });
-    }
-
-    const url = `https://finnhub.io/api/v1/forex/candle?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${to}&token=${apiKey}`;
-
-    const https = require('https');
-    https.get(url, (apiRes) => {
-      let body = '';
-      apiRes.on('data', (chunk) => body += chunk);
-      apiRes.on('end', () => {
-        try {
-          const data = JSON.parse(body);
-          if (data.s !== 'ok' || !data.t) {
-            return res.status(400).json({ error: 'No data from Finnhub', details: data });
-          }
-
-          const formattedCandles = data.t.map((timestamp, index) => ({
-            time: timestamp,
-            open: data.o[index],
-            high: data.h[index],
-            low: data.l[index],
-            close: data.c[index]
-          }));
-
-          res.json(formattedCandles);
-        } catch (e) {
-          res.status(500).json({ error: 'Failed to parse response from Finnhub' });
-        }
-      });
-    }).on('error', (err) => {
-      res.status(500).json({ error: err.message });
-    });
-
-  } catch (error) {
-    res.status(500).json({ error: 'Server error', details: error.message });
-  }
-});
 
 // --- Start listening -----------------------------------------------------
 server.listen(PORT, () => {
