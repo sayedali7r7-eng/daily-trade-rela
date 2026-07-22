@@ -163,6 +163,20 @@ function backfillHistoricalCandles(realCandles, cfg, intervalSeconds, assetKey) 
   return synthetic.concat(realCandles);
 }
 
+// Twelve Data's `datetime` field ("YYYY-MM-DD HH:mm:ss" intraday, or
+// "YYYY-MM-DD" for daily+) never includes a timezone designator. Even with
+// &timezone=UTC on the request (see the url below), new Date(datetimeStr)
+// alone would still parse that bare string in whatever timezone the Node
+// process happens to default to — which is exactly the kind of silent skew
+// that desyncs historical candle times from the live Finnhub feed (always
+// UTC via Date.now()). Appending an explicit "Z" pins the parse to UTC
+// regardless of hosting environment, independent of the query param.
+function parseTwelveDataTimeUTC(datetimeStr) {
+  const iso = String(datetimeStr).includes('T') ? datetimeStr : String(datetimeStr).replace(' ', 'T');
+  const withZone = /[Zz]|[+-]\d{2}:?\d{2}$/.test(iso) ? iso : iso + 'Z';
+  return Math.floor(new Date(withZone).getTime() / 1000);
+}
+
 function handleCandlesRequest(searchParams, res) {
   const symbolParam = (searchParams.get("symbol") || "GOLD").toUpperCase();
   const intervalParam = searchParams.get("interval") || "5m";
@@ -174,7 +188,11 @@ function handleCandlesRequest(searchParams, res) {
   const intervalSeconds = intervalParam === "1m" ? 60 : 300;
   const outputsize = Number(searchParams.get("outputsize")) || 500;
 
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(cfg.tdSymbol)}&interval=${tdInterval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_API_KEY}`;
+  // timezone=UTC is what actually pins Twelve Data's `datetime` values to
+  // UTC. Without it, intraday datetimes come back in the exchange's local
+  // timezone with no offset marker — silently skewed against the live
+  // Finnhub feed below, which is always UTC via Date.now().
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(cfg.tdSymbol)}&interval=${tdInterval}&outputsize=${outputsize}&timezone=UTC&apikey=${TWELVE_DATA_API_KEY}`;
 
   const sendJson = (candles) => {
     const payload = JSON.stringify(candles);
@@ -214,7 +232,7 @@ function handleCandlesRequest(searchParams, res) {
 
         // Twelve Data returns newest-first; reverse for Lightweight Charts.
         const formattedCandles = json.values.slice().reverse().map((c) => ({
-          time: Math.floor(new Date(c.datetime).getTime() / 1000),
+          time: parseTwelveDataTimeUTC(c.datetime),
           open: roundToDecimals(parseFloat(c.open), cfg.decimals),
           high: roundToDecimals(parseFloat(c.high), cfg.decimals),
           low: roundToDecimals(parseFloat(c.low), cfg.decimals),
