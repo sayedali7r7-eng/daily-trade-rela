@@ -69,7 +69,7 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
 // tickers in particular vary by data vendor.
 const SYMBOL_CONFIG = {
   GOLD:   { tdSymbol: "XAU/USD", decimals: 2, volatilityPct: 0.0012, fallbackPrice: 2350 },
-  NASDAQ: { tdSymbol: "NDX",     decimals: 2, volatilityPct: 0.0010, fallbackPrice: 18500 }, // NAS100
+  NASDAQ: { tdSymbol: "NDX",     decimals: 2, volatilityPct: 0.0010, fallbackPrice: 29200 }, // NAS100 — keep near current spot; a stale value here creates a vertical seam against live ticks (see backfillHistoricalCandles)
   US30:   { tdSymbol: "DJI",     decimals: 2, volatilityPct: 0.0008, fallbackPrice: 39500 }, // Dow / US30
   US500:  { tdSymbol: "SPX",     decimals: 2, volatilityPct: 0.0009, fallbackPrice: 5300 },  // S&P 500
   EURUSD: { tdSymbol: "EUR/USD", decimals: 5, volatilityPct: 0.0006, fallbackPrice: 1.085 },
@@ -120,7 +120,14 @@ function backfillHistoricalCandles(realCandles, cfg, intervalSeconds) {
   if (needed <= 0) return realCandles;
 
   const anchor = realCandles[0]; // earliest real candle, since realCandles is oldest-first
-  const anchorPrice = anchor ? anchor.open : cfg.fallbackPrice;
+
+  // Only trust the real anchor candle's open if it's an actual usable price.
+  // Falling through to cfg.fallbackPrice on anything else (missing candle,
+  // NaN/0 from a malformed API response, etc.) is what prevents the
+  // synthetic run from chaining off garbage and creating a vertical seam
+  // against real data (or against the separate live tick feed).
+  const anchorOpen = anchor ? anchor.open : null;
+  const anchorPrice = Number.isFinite(anchorOpen) && anchorOpen > 0 ? anchorOpen : cfg.fallbackPrice;
   const anchorTime = anchor ? anchor.time : Math.floor(Date.now() / 1000);
   const vol = anchorPrice * cfg.volatilityPct;
 
