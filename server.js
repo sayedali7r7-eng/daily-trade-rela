@@ -68,8 +68,8 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
 // symbol search if any of these come back empty in practice, since index
 // tickers in particular vary by data vendor.
 const SYMBOL_CONFIG = {
-  GOLD:   { tdSymbol: "XAU/USD", decimals: 2, volatilityPct: 0.0012, fallbackPrice: 2350 },
-  NASDAQ: { tdSymbol: "NDX",     decimals: 2, volatilityPct: 0.0010, fallbackPrice: 29200 }, // NAS100 — keep near current spot; a stale value here creates a vertical seam against live ticks (see backfillHistoricalCandles)
+  GOLD:   { tdSymbol: "XAU/USD", decimals: 2, volatilityPct: 0.0012, fallbackPrice: 4068 },  // was 2350 — stale by thousands of dollars vs. current spot, which is exactly what produced the cliff at the synthetic/live join
+  NASDAQ: { tdSymbol: "NDX",     decimals: 1, volatilityPct: 0.0010, fallbackPrice: 19850 }, // NAS100 — was 29200 (~47% too high); keep near current spot, matching the frontend's own base price, and decimals matching the frontend's 1-decimal NAS100 display
   US30:   { tdSymbol: "DJI",     decimals: 2, volatilityPct: 0.0008, fallbackPrice: 39500 }, // Dow / US30
   US500:  { tdSymbol: "SPX",     decimals: 2, volatilityPct: 0.0009, fallbackPrice: 5300 },  // S&P 500
   EURUSD: { tdSymbol: "EUR/USD", decimals: 5, volatilityPct: 0.0006, fallbackPrice: 1.085 },
@@ -114,7 +114,7 @@ function roundToDecimals(value, decimals) {
 // same technique the frontend already uses for its own warm-up bars — so
 // the newest synthetic bar closes exactly where real history begins and
 // there's no visible seam at the join.
-function backfillHistoricalCandles(realCandles, cfg, intervalSeconds) {
+function backfillHistoricalCandles(realCandles, cfg, intervalSeconds, assetKey) {
   const targetCount = Math.floor(SEVEN_DAYS_SECONDS / intervalSeconds);
   const needed = targetCount - realCandles.length;
   if (needed <= 0) return realCandles;
@@ -122,12 +122,22 @@ function backfillHistoricalCandles(realCandles, cfg, intervalSeconds) {
   const anchor = realCandles[0]; // earliest real candle, since realCandles is oldest-first
 
   // Only trust the real anchor candle's open if it's an actual usable price.
-  // Falling through to cfg.fallbackPrice on anything else (missing candle,
-  // NaN/0 from a malformed API response, etc.) is what prevents the
-  // synthetic run from chaining off garbage and creating a vertical seam
-  // against real data (or against the separate live tick feed).
+  // Falling through on anything else (missing candle, NaN/0 from a
+  // malformed API response, etc.) is what prevents the synthetic run from
+  // chaining off garbage and creating a vertical seam against real data (or
+  // against the separate live tick feed). When there's no usable real
+  // candle at all, prefer the most recent live tick we've actually seen
+  // (lastPrice[assetKey], updated continuously by the WebSocket feed) over
+  // the static cfg.fallbackPrice — a live tick can never go stale the way a
+  // hardcoded number in source can, which is exactly what caused the
+  // multi-thousand-point cliff this function is meant to prevent. The
+  // static fallback is now only a last resort for the brief window right
+  // after a fresh server restart before any tick has arrived.
   const anchorOpen = anchor ? anchor.open : null;
-  const anchorPrice = Number.isFinite(anchorOpen) && anchorOpen > 0 ? anchorOpen : cfg.fallbackPrice;
+  const liveAnchor = assetKey && Number.isFinite(lastPrice[assetKey]) && lastPrice[assetKey] > 0 ? lastPrice[assetKey] : null;
+  const anchorPrice = Number.isFinite(anchorOpen) && anchorOpen > 0
+    ? anchorOpen
+    : (liveAnchor ?? cfg.fallbackPrice);
   const anchorTime = anchor ? anchor.time : Math.floor(Date.now() / 1000);
   const vol = anchorPrice * cfg.volatilityPct;
 
@@ -184,7 +194,7 @@ function handleCandlesRequest(searchParams, res) {
   // not only Gold — reliably gets a full 7-day array back.
   const finalize = (realCandles) => {
     const candles = realCandles.length < HISTORY_BACKFILL_THRESHOLD
-      ? backfillHistoricalCandles(realCandles, cfg, intervalSeconds)
+      ? backfillHistoricalCandles(realCandles, cfg, intervalSeconds, assetKey)
       : realCandles;
     sendJson(candles);
   };
