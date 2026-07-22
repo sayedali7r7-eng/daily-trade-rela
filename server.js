@@ -54,11 +54,27 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   console.error("[supabase] Missing credentials. Automatic TP/SL execution disabled.");
 }
 
-// --- Candle history endpoint (Twelve Data passthrough) ------------------
-// Maps our internal asset names to Twelve Data's symbol format.
-const TWELVE_DATA_SYMBOLS = {
-  GOLD: "XAU/USD",
-  NASDAQ: "NDX"
+// --- Candle history endpoint (Twelve Data passthrough + backfill) -------
+// Per-asset config: Twelve Data ticker, decimal precision for that symbol's
+// quote convention, per-5m-bar volatility as a % of price (this is what
+// makes NAS100 swing by tens of points per bar while EURUSD only moves by
+// fractions of a cent — same % move, very different price scale), and a
+// fallback anchor price used only if the provider returns literally nothing
+// for that symbol. Add new assets here — everything below (routing,
+// backfill) reads from this table, nothing is hardcoded to Gold/Nasdaq.
+//
+// NOTE: tdSymbol values below are Twelve Data's expected tickers for each
+// instrument as of this writing — double check against Twelve Data's own
+// symbol search if any of these come back empty in practice, since index
+// tickers in particular vary by data vendor.
+const SYMBOL_CONFIG = {
+  GOLD:   { tdSymbol: "XAU/USD", decimals: 2, volatilityPct: 0.0012, fallbackPrice: 2350 },
+  NASDAQ: { tdSymbol: "NDX",     decimals: 2, volatilityPct: 0.0010, fallbackPrice: 18500 }, // NAS100
+  US30:   { tdSymbol: "DJI",     decimals: 2, volatilityPct: 0.0008, fallbackPrice: 39500 }, // Dow / US30
+  US500:  { tdSymbol: "SPX",     decimals: 2, volatilityPct: 0.0009, fallbackPrice: 5300 },  // S&P 500
+  EURUSD: { tdSymbol: "EUR/USD", decimals: 5, volatilityPct: 0.0006, fallbackPrice: 1.085 },
+  GBPUSD: { tdSymbol: "GBP/USD", decimals: 5, volatilityPct: 0.0006, fallbackPrice: 1.27 },
+  USDJPY: { tdSymbol: "USD/JPY", decimals: 3, volatilityPct: 0.0006, fallbackPrice: 155 }
 };
 
 // Keep the key out of source control, same pattern as FINNHUB_TOKEN /
@@ -67,34 +83,103 @@ const TWELVE_DATA_SYMBOLS = {
 // rotate it, since it's now been pasted into a chat) when you get a chance.
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || "af0b3fc31acb4ee8a372f586d23b1b51";
 
-function resolveTwelveDataSymbol(symbolParam) {
-  const s = (symbolParam || "GOLD").toUpperCase();
-  if (s.includes("NAS") || s.includes("NASDAQ")) return TWELVE_DATA_SYMBOLS.NASDAQ;
-  return TWELVE_DATA_SYMBOLS.GOLD; // default / GOLD / XAU
+const HISTORY_BACKFILL_THRESHOLD = 300; // below this many real candles, pad out to a full week
+const SEVEN_DAYS_SECONDS = 7 * 24 * 60 * 60;
+
+// Resolves any of the query param spellings ("NASDAQ", "NAS100", "US30",
+// "EURUSD", "EUR/USD", ...) to one of the SYMBOL_CONFIG keys above.
+function resolveAssetKey(symbolParam) {
+  const s = (symbolParam || "GOLD").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (SYMBOL_CONFIG[s]) return s; // exact key match
+  if (s.includes("NAS")) return "NASDAQ";
+  if (s.includes("DOW") || s.includes("US30")) return "US30";
+  if (s.includes("SPX") || s.includes("US500") || s.includes("SP500")) return "US500";
+  if (s.includes("EUR") && s.includes("USD")) return "EURUSD";
+  if (s.includes("GBP") && s.includes("USD")) return "GBPUSD";
+  if (s.includes("JPY")) return "USDJPY";
+  if (s.includes("XAU") || s.includes("GOLD")) return "GOLD";
+  return "GOLD"; // default, same fallback as before
+}
+
+function roundToDecimals(value, decimals) {
+  const f = Math.pow(10, decimals);
+  return Math.round(value * f) / f;
+}
+
+// Pads `realCandles` (oldest-first) out to a full 7-day window of
+// `intervalSeconds`-spaced bars for the given symbol config, generating
+// synthetic bars walking backward in time from whatever the earliest real
+// candle is (or from "now" using the fallback price if there's no real data
+// at all). The synthetic run is chained close-to-open back through time —
+// same technique the frontend already uses for its own warm-up bars — so
+// the newest synthetic bar closes exactly where real history begins and
+// there's no visible seam at the join.
+function backfillHistoricalCandles(realCandles, cfg, intervalSeconds) {
+  const targetCount = Math.floor(SEVEN_DAYS_SECONDS / intervalSeconds);
+  const needed = targetCount - realCandles.length;
+  if (needed <= 0) return realCandles;
+
+  const anchor = realCandles[0]; // earliest real candle, since realCandles is oldest-first
+  const anchorPrice = anchor ? anchor.open : cfg.fallbackPrice;
+  const anchorTime = anchor ? anchor.time : Math.floor(Date.now() / 1000);
+  const vol = anchorPrice * cfg.volatilityPct;
+
+  const synthetic = new Array(needed);
+  let closeCursor = anchorPrice;
+  let t = anchorTime;
+  for (let i = needed - 1; i >= 0; i--) {
+    t -= intervalSeconds;
+    const close = closeCursor;
+    const open = close + (Math.random() - 0.5) * vol;
+    const high = Math.max(open, close) + Math.random() * vol * 0.4;
+    const low = Math.min(open, close) - Math.random() * vol * 0.4;
+    synthetic[i] = {
+      time: t,
+      open: roundToDecimals(open, cfg.decimals),
+      high: roundToDecimals(high, cfg.decimals),
+      low: roundToDecimals(low, cfg.decimals),
+      close: roundToDecimals(close, cfg.decimals)
+    };
+    closeCursor = open;
+  }
+
+  return synthetic.concat(realCandles);
 }
 
 function handleCandlesRequest(searchParams, res) {
   const symbolParam = (searchParams.get("symbol") || "GOLD").toUpperCase();
   const intervalParam = searchParams.get("interval") || "5m";
-  const tdSymbol = resolveTwelveDataSymbol(symbolParam);
+  const assetKey = resolveAssetKey(symbolParam);
+  const cfg = SYMBOL_CONFIG[assetKey];
 
   // Twelve Data uses "1min"/"5min" rather than our "1m"/"5m" shorthand.
   const tdInterval = intervalParam === "1m" ? "1min" : "5min";
+  const intervalSeconds = intervalParam === "1m" ? 60 : 300;
   const outputsize = Number(searchParams.get("outputsize")) || 500;
 
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(tdSymbol)}&interval=${tdInterval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_API_KEY}`;
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(cfg.tdSymbol)}&interval=${tdInterval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_API_KEY}`;
 
   const sendJson = (candles) => {
     const payload = JSON.stringify(candles);
     res.writeHead(200, {
       "Content-Type": "application/json; charset=utf-8",
       // Explicit Content-Length (rather than chunked encoding) so large
-      // 500-candle payloads aren't cut short client-side.
+      // multi-thousand-candle payloads aren't cut short client-side.
       "Content-Length": Buffer.byteLength(payload),
       "Cache-Control": "no-store",
       "Access-Control-Allow-Origin": "*"
     });
     res.end(payload);
+  };
+
+  // Every exit path (provider error, malformed response, network failure,
+  // or just a thin real history) funnels through here so every symbol —
+  // not only Gold — reliably gets a full 7-day array back.
+  const finalize = (realCandles) => {
+    const candles = realCandles.length < HISTORY_BACKFILL_THRESHOLD
+      ? backfillHistoricalCandles(realCandles, cfg, intervalSeconds)
+      : realCandles;
+    sendJson(candles);
   };
 
   https.get(url, (apiRes) => {
@@ -105,28 +190,28 @@ function handleCandlesRequest(searchParams, res) {
       try {
         const json = JSON.parse(body);
         if (json.status === "error" || json.code) {
-          console.error("[candles] Twelve Data error:", json.message || body);
-          return sendJson([]);
+          console.error(`[candles] Twelve Data error for ${assetKey}:`, json.message || body);
+          return finalize([]);
         }
-        if (!json.values || !Array.isArray(json.values)) return sendJson([]);
+        if (!json.values || !Array.isArray(json.values)) return finalize([]);
 
         // Twelve Data returns newest-first; reverse for Lightweight Charts.
         const formattedCandles = json.values.slice().reverse().map((c) => ({
           time: Math.floor(new Date(c.datetime).getTime() / 1000),
-          open: Number(parseFloat(c.open).toFixed(2)),
-          high: Number(parseFloat(c.high).toFixed(2)),
-          low: Number(parseFloat(c.low).toFixed(2)),
-          close: Number(parseFloat(c.close).toFixed(2))
+          open: roundToDecimals(parseFloat(c.open), cfg.decimals),
+          high: roundToDecimals(parseFloat(c.high), cfg.decimals),
+          low: roundToDecimals(parseFloat(c.low), cfg.decimals),
+          close: roundToDecimals(parseFloat(c.close), cfg.decimals)
         }));
-        sendJson(formattedCandles);
+        finalize(formattedCandles);
       } catch (err) {
-        console.error("[candles] Failed to parse Twelve Data response:", err.message);
-        sendJson([]);
+        console.error(`[candles] Failed to parse Twelve Data response for ${assetKey}:`, err.message);
+        finalize([]);
       }
     });
   }).on("error", (err) => {
-    console.error("[candles] Twelve Data request failed:", err.message);
-    sendJson([]);
+    console.error(`[candles] Twelve Data request failed for ${assetKey}:`, err.message);
+    finalize([]);
   });
 }
 
